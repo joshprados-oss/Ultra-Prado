@@ -1,5 +1,5 @@
 """
-Strava OAuth integration — activity stats, weekly summaries, and CSV export.
+Strava OAuth integration — activity stats, weekly summaries, CSV export, and charts.
 
 Usage:
   python strava.py                       # last 30 activities (all types)
@@ -9,6 +9,7 @@ Usage:
   python strava.py --weeks               # aggregate into weekly summaries
   python strava.py --export output.csv   # also write results to CSV
   python strava.py --type Ride --weeks   # combine flags freely
+  python strava.py --count 90 --plot     # 3-panel dashboard chart (saves PNG + opens window)
 
 Setup:
   1. In your Strava API app settings, add localhost as an Authorized Callback Domain.
@@ -438,6 +439,225 @@ def export_csv(activities: list[dict], path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Visualization
+# ---------------------------------------------------------------------------
+
+_ORANGE = "#FC4C02"   # Strava brand orange
+_WHITE  = "#E8E8E8"
+_GRAY   = "#555555"
+_BG     = "#111111"
+_PANEL  = "#1C1C1C"
+
+# Sport-type color palette for the weekly stacked bars
+_TYPE_COLORS: dict[str, str] = {
+    "run":              _ORANGE,
+    "trailrun":         "#E07000",
+    "virtualrun":       "#C04000",
+    "ride":             "#2B7CE9",
+    "mountainbikeride": "#1A5CAF",
+    "gravelride":       "#4DA6FF",
+    "virtualride":      "#0A3C7F",
+    "ebikeride":        "#7EC8E3",
+    "swim":             "#2ECC71",
+    "walk":             "#F1C40F",
+    "hike":             "#E67E22",
+}
+_FALLBACK_COLOR = "#888888"
+
+
+def _rolling_avg(values: list[float], window: int) -> list[float]:
+    out = []
+    for i, _ in enumerate(values):
+        start = max(0, i - window + 1)
+        out.append(sum(values[start : i + 1]) / (i - start + 1))
+    return out
+
+
+def plot_dashboard(
+    activities: list[dict],
+    save_path: str = "strava_dashboard.png",
+    show: bool = True,
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+        from matplotlib.ticker import FuncFormatter
+        from matplotlib.patches import Patch
+    except ImportError:
+        raise SystemExit(
+            "matplotlib is required for --plot.  Run: pip install matplotlib"
+        )
+
+    plt.rcParams.update({
+        "figure.facecolor": _BG,
+        "axes.facecolor":   _PANEL,
+        "axes.edgecolor":   _GRAY,
+        "axes.labelcolor":  _WHITE,
+        "xtick.color":      _WHITE,
+        "ytick.color":      _WHITE,
+        "text.color":       _WHITE,
+        "grid.color":       _GRAY,
+        "grid.alpha":       0.3,
+        "font.family":      "monospace",
+    })
+
+    acts_asc = sorted(activities, key=lambda a: a["start_date_local"])
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 13), constrained_layout=True)
+    fig.suptitle("Strava Training Dashboard", fontsize=16, fontweight="bold",
+                 color=_ORANGE, y=1.01)
+
+    # ── Panel 1: Weekly distance stacked by sport type ───────────────────────
+    ax1 = axes[0]
+
+    week_order: list[str] = []
+    week_type_dist: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    for act in acts_asc:
+        wk = _week_monday(act["start_date_local"])
+        sport = act.get("sport_type", act.get("type", "other")).lower()
+        week_type_dist[wk][sport] += _m_to_mi(act.get("distance", 0))
+        if wk not in week_order:
+            week_order.append(wk)
+
+    week_dates = [datetime.fromisoformat(w) for w in week_order]
+    week_totals = [sum(week_type_dist[w].values()) for w in week_order]
+
+    # collect all sport types present, sorted by total volume desc
+    all_types: dict[str, float] = defaultdict(float)
+    for wk in week_order:
+        for sp, d in week_type_dist[wk].items():
+            all_types[sp] += d
+    sorted_types = sorted(all_types, key=lambda t: all_types[t], reverse=True)
+
+    bar_width = max(3, min(6, 300 // max(len(week_order), 1)))
+    bottoms = [0.0] * len(week_order)
+    legend_patches = []
+    for sport in sorted_types:
+        vals = [week_type_dist[w].get(sport, 0.0) for w in week_order]
+        color = _TYPE_COLORS.get(sport, _FALLBACK_COLOR)
+        ax1.bar(week_dates, vals, bottom=bottoms, width=bar_width,
+                color=color, alpha=0.9, zorder=2)
+        bottoms = [b + v for b, v in zip(bottoms, vals)]
+        legend_patches.append(Patch(color=color, label=_short_type(sport)))
+
+    # 4-week rolling average overlay
+    if len(week_totals) >= 2:
+        roll = _rolling_avg(week_totals, min(4, len(week_totals)))
+        ax1.plot(week_dates, roll, color=_WHITE, linewidth=1.8,
+                 linestyle="--", label="4-wk avg", zorder=3)
+
+    ax1.set_title("Weekly Distance", fontweight="bold", pad=8)
+    ax1.set_ylabel("Miles")
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+    ax1.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=0, interval=max(1, len(week_order)//10)))
+    ax1.tick_params(axis="x", rotation=35)
+    ax1.grid(axis="y", zorder=0)
+    ax1.set_xlim(
+        week_dates[0] - timedelta(days=4),
+        week_dates[-1] + timedelta(days=4),
+    )
+    handles = legend_patches + [
+        plt.Line2D([0], [0], color=_WHITE, linewidth=1.8, linestyle="--", label="4-wk avg")
+    ]
+    ax1.legend(handles=handles, loc="upper left", fontsize=7,
+               framealpha=0.3, ncol=min(len(legend_patches) + 1, 6))
+
+    # ── Panel 2: Run pace trend ───────────────────────────────────────────────
+    ax2 = axes[1]
+
+    runs = [
+        a for a in acts_asc
+        if a.get("sport_type", a.get("type", "")).lower() in _PACE_TYPES
+        and a.get("distance", 0) > 400
+        and a.get("moving_time", 0) > 0
+    ]
+
+    if runs:
+        run_dates  = [datetime.fromisoformat(a["start_date_local"]) for a in runs]
+        # pace in decimal min/mile (for easy math; formatted on axis)
+        run_paces  = [a["moving_time"] / _m_to_mi(a["distance"]) / 60 for a in runs]
+        run_dists  = [_m_to_mi(a.get("distance", 0)) for a in runs]
+        max_dist   = max(run_dists) if run_dists else 1
+
+        # bubble size proportional to distance
+        sizes = [30 + 120 * (d / max_dist) for d in run_dists]
+
+        ax2.scatter(run_dates, run_paces, s=sizes, color=_ORANGE,
+                    alpha=0.65, zorder=3, edgecolors="none")
+
+        if len(run_paces) >= 2:
+            roll_p = _rolling_avg(run_paces, min(5, len(run_paces)))
+            ax2.plot(run_dates, roll_p, color=_WHITE, linewidth=2,
+                     label="5-run avg", zorder=4)
+            ax2.legend(loc="upper left", fontsize=8, framealpha=0.3)
+
+        def _pace_fmt(y: float, _pos: int) -> str:
+            m = int(y)
+            s = int(round((y - m) * 60))
+            if s == 60:
+                m += 1; s = 0
+            return f"{m}:{s:02d}"
+
+        ax2.yaxis.set_major_formatter(FuncFormatter(_pace_fmt))
+        # invert so faster (lower min/mi) is at the top
+        ymin, ymax = ax2.get_ylim()
+        ax2.set_ylim(ymax + 0.2, max(ymin - 0.2, 0))
+        ax2.set_title("Run Pace  (faster = higher)", fontweight="bold", pad=8)
+        ax2.set_ylabel("min / mile")
+        ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+        ax2.xaxis.set_major_locator(
+            mdates.WeekdayLocator(byweekday=0, interval=max(1, len(week_order)//10))
+        )
+        ax2.tick_params(axis="x", rotation=35)
+        ax2.grid(zorder=0)
+    else:
+        ax2.text(0.5, 0.5, "No run data in this range",
+                 ha="center", va="center", transform=ax2.transAxes,
+                 fontsize=13, color=_GRAY)
+        ax2.set_title("Run Pace", fontweight="bold", pad=8)
+
+    # ── Panel 3: Heart-rate trend ─────────────────────────────────────────────
+    ax3 = axes[2]
+
+    hr_acts = [a for a in acts_asc if a.get("average_heartrate")]
+
+    if hr_acts:
+        hr_dates  = [datetime.fromisoformat(a["start_date_local"]) for a in hr_acts]
+        hr_vals   = [a["average_heartrate"] for a in hr_acts]
+        hr_sports = [a.get("sport_type", a.get("type", "other")).lower() for a in hr_acts]
+        hr_colors = [_TYPE_COLORS.get(s, _FALLBACK_COLOR) for s in hr_sports]
+
+        ax3.scatter(hr_dates, hr_vals, c=hr_colors, s=40, alpha=0.7,
+                    zorder=3, edgecolors="none")
+
+        if len(hr_vals) >= 2:
+            roll_hr = _rolling_avg(hr_vals, min(7, len(hr_vals)))
+            ax3.plot(hr_dates, roll_hr, color=_WHITE, linewidth=2,
+                     label="7-activity avg", zorder=4)
+            ax3.legend(loc="upper left", fontsize=8, framealpha=0.3)
+
+        ax3.set_title("Average Heart Rate", fontweight="bold", pad=8)
+        ax3.set_ylabel("bpm")
+        ax3.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+        ax3.xaxis.set_major_locator(
+            mdates.WeekdayLocator(byweekday=0, interval=max(1, len(week_order)//10))
+        )
+        ax3.tick_params(axis="x", rotation=35)
+        ax3.grid(zorder=0)
+    else:
+        ax3.text(0.5, 0.5, "No heart-rate data in this range",
+                 ha="center", va="center", transform=ax3.transAxes,
+                 fontsize=13, color=_GRAY)
+        ax3.set_title("Average Heart Rate", fontweight="bold", pad=8)
+
+    fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor=_BG)
+    print(f"Dashboard saved to {save_path}")
+
+    if show:
+        plt.show()
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -451,6 +671,7 @@ def parse_args() -> argparse.Namespace:
             "  python strava.py --count 60 --type Run\n"
             "  python strava.py --since 2026-01-01 --weeks\n"
             "  python strava.py --export activities.csv\n"
+            "  python strava.py --count 90 --plot\n"
         ),
     )
     p.add_argument("--count", type=int, default=30, metavar="N",
@@ -463,6 +684,10 @@ def parse_args() -> argparse.Namespace:
                    help="Show weekly aggregates instead of individual activities")
     p.add_argument("--export", metavar="FILE",
                    help="Write results to a CSV file")
+    p.add_argument("--plot", action="store_true",
+                   help="Generate a 3-panel dashboard chart (saves strava_dashboard.png)")
+    p.add_argument("--no-show", action="store_true",
+                   help="With --plot: save the PNG but do not open a window")
     return p.parse_args()
 
 
@@ -504,6 +729,9 @@ def main() -> None:
 
     if args.export:
         export_csv(activities, args.export)
+
+    if args.plot:
+        plot_dashboard(activities, show=not args.no_show)
 
 
 if __name__ == "__main__":
