@@ -148,7 +148,12 @@ def _load_tokens() -> dict | None:
         return json.load(f)
 
 
-def get_access_token(client_id: str, client_secret: str, local_auth: bool = False) -> str:
+def get_access_token(
+    client_id: str,
+    client_secret: str,
+    local_auth: bool = False,
+    redirect_url: str | None = None,
+) -> str:
     cached = _load_tokens()
 
     if cached:
@@ -160,16 +165,25 @@ def get_access_token(client_id: str, client_secret: str, local_auth: bool = Fals
         return data["access_token"]
 
     auth_url = _build_auth_url(client_id)
-    print(f"Open this URL in your browser to authorize:\n\n  {auth_url}\n")
 
-    if local_auth:
+    if redirect_url:
+        # Code supplied directly — no browser interaction needed
+        params = parse_qs(urlparse(redirect_url).query)
+        if "error" in params:
+            raise SystemExit(f"Strava returned an error: {params['error'][0]}")
+        if "code" not in params:
+            raise SystemExit("No authorization code found in the provided URL.")
+        code = params["code"][0]
+    elif local_auth:
+        print(f"Open this URL in your browser:\n\n  {auth_url}\n")
         webbrowser.open(auth_url)
         print("Waiting for callback on http://localhost:8080/callback ...")
         code = _capture_auth_code_local()
     else:
+        print(f"Open this URL in your browser:\n\n  {auth_url}\n")
         code = _capture_auth_code_manual()
 
-    print("\nExchanging code for tokens...")
+    print("Exchanging code for tokens...")
     data = _exchange_code(client_id, client_secret, code)
     _save_tokens(data)
     print(f"Tokens cached in {TOKEN_CACHE}\n")
@@ -720,6 +734,8 @@ def parse_args() -> argparse.Namespace:
                    help="With --plot: save the PNG but do not open a window")
     p.add_argument("--local-auth", action="store_true",
                    help="Use a local callback server for OAuth instead of the paste-URL flow")
+    p.add_argument("--redirect-url", metavar="URL",
+                   help="Paste the full localhost:8080/callback?... URL here to skip interactive prompt")
     return p.parse_args()
 
 
@@ -734,7 +750,11 @@ def main() -> None:
             "Missing credentials. Set STRAVA_CLIENT_ID and STRAVA_CLIENT_SECRET in .env"
         )
 
-    access_token = get_access_token(client_id, client_secret, local_auth=args.local_auth)
+    access_token = get_access_token(
+        client_id, client_secret,
+        local_auth=args.local_auth,
+        redirect_url=args.redirect_url,
+    )
 
     after: int | None = None
     if args.since:
