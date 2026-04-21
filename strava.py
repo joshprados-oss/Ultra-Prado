@@ -60,7 +60,8 @@ def _build_auth_url(client_id: str) -> str:
     return f"{AUTH_URL}?{urlencode(params)}"
 
 
-def _capture_auth_code() -> str:
+def _capture_auth_code_local() -> str:
+    """One-shot local HTTP server — use when running on your own machine."""
     captured = {}
 
     class Handler(BaseHTTPRequestHandler):
@@ -86,6 +87,31 @@ def _capture_auth_code() -> str:
     if "code" not in captured:
         raise RuntimeError("Authorization failed — no code returned by Strava.")
     return captured["code"]
+
+
+def _capture_auth_code_manual() -> str:
+    """Paste-the-URL flow — works from any machine or remote environment."""
+    print(
+        "\n"
+        "Steps:\n"
+        "  1. Open the link above in your browser.\n"
+        "  2. Click 'Authorize' on the Strava page.\n"
+        "  3. Your browser will try to load localhost:8080 and show an error\n"
+        "     like 'This site can't be reached' — that is completely normal.\n"
+        "  4. Copy the full URL from your browser's address bar and paste it below.\n"
+        "     It will look like:  http://localhost:8080/callback?state=&code=abc123...\n"
+    )
+    while True:
+        raw = input("Paste the redirect URL here: ").strip()
+        if not raw:
+            print("Nothing pasted — please try again.")
+            continue
+        params = parse_qs(urlparse(raw).query)
+        if "code" in params:
+            return params["code"][0]
+        if "error" in params:
+            raise RuntimeError(f"Strava returned an error: {params['error'][0]}")
+        print("Could not find a code in that URL. Make sure you copied the full address bar URL.")
 
 
 def _exchange_code(client_id: str, client_secret: str, code: str) -> dict:
@@ -122,7 +148,7 @@ def _load_tokens() -> dict | None:
         return json.load(f)
 
 
-def get_access_token(client_id: str, client_secret: str) -> str:
+def get_access_token(client_id: str, client_secret: str, local_auth: bool = False) -> str:
     cached = _load_tokens()
 
     if cached:
@@ -133,13 +159,17 @@ def get_access_token(client_id: str, client_secret: str) -> str:
         _save_tokens(data)
         return data["access_token"]
 
-    print("Opening browser for Strava authorization...")
     auth_url = _build_auth_url(client_id)
-    print(f"\n  {auth_url}\n")
-    webbrowser.open(auth_url)
-    print("Waiting for callback on http://localhost:8080/callback ...")
-    code = _capture_auth_code()
-    print("Exchanging code for tokens...")
+    print(f"Open this URL in your browser to authorize:\n\n  {auth_url}\n")
+
+    if local_auth:
+        webbrowser.open(auth_url)
+        print("Waiting for callback on http://localhost:8080/callback ...")
+        code = _capture_auth_code_local()
+    else:
+        code = _capture_auth_code_manual()
+
+    print("\nExchanging code for tokens...")
     data = _exchange_code(client_id, client_secret, code)
     _save_tokens(data)
     print(f"Tokens cached in {TOKEN_CACHE}\n")
@@ -688,6 +718,8 @@ def parse_args() -> argparse.Namespace:
                    help="Generate a 3-panel dashboard chart (saves strava_dashboard.png)")
     p.add_argument("--no-show", action="store_true",
                    help="With --plot: save the PNG but do not open a window")
+    p.add_argument("--local-auth", action="store_true",
+                   help="Use a local callback server for OAuth instead of the paste-URL flow")
     return p.parse_args()
 
 
@@ -702,7 +734,7 @@ def main() -> None:
             "Missing credentials. Set STRAVA_CLIENT_ID and STRAVA_CLIENT_SECRET in .env"
         )
 
-    access_token = get_access_token(client_id, client_secret)
+    access_token = get_access_token(client_id, client_secret, local_auth=args.local_auth)
 
     after: int | None = None
     if args.since:
